@@ -32,6 +32,29 @@ class SPADE(nn.Module):
 #  SPADE residual block
 # ---------------------------------------------------------------------------
 
+class SelfAttention(nn.Module):
+    """Scaled dot-product spatial self-attention."""
+
+    def __init__(self, in_nc):
+        super().__init__()
+        self.ch_k = max(in_nc // 8, 1)
+        self.query = spectral_norm(nn.Conv2d(in_nc, self.ch_k, 1))
+        self.key = spectral_norm(nn.Conv2d(in_nc, self.ch_k, 1))
+        self.value = spectral_norm(nn.Conv2d(in_nc, in_nc, 1))
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.scale = self.ch_k ** -0.5
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        q = self.query(x).view(B, -1, H * W).permute(0, 2, 1)
+        k = self.key(x).view(B, -1, H * W)
+        attn = torch.bmm(q, k) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        v = self.value(x).view(B, -1, H * W)
+        out = torch.bmm(v, attn.permute(0, 2, 1)).view(B, C, H, W)
+        return self.gamma * out + x
+
+
 class SPADEResBlock(nn.Module):
     def __init__(self, fin, fout, label_nc):
         super().__init__()
@@ -68,18 +91,18 @@ class SPADEGenerator(nn.Module):
     No FC layer => dramatically fewer parameters.
     """
 
-    def __init__(self, label_nc=1, output_nc=1, ngf=64):
+    def __init__(self, label_nc=1, output_nc=1, ngf=64, use_attention=True,
+                 output_act="sigmoid"):
         super().__init__()
         nf = ngf
 
-        # Encoder: 256 -> 128 -> 64 -> 32 -> 16
         self.enc1 = nn.Sequential(nn.Conv2d(label_nc, nf, 4, 2, 1), nn.LeakyReLU(0.2, True))
         self.enc2 = nn.Sequential(nn.Conv2d(nf, nf * 2, 4, 2, 1), nn.InstanceNorm2d(nf * 2), nn.LeakyReLU(0.2, True))
         self.enc3 = nn.Sequential(nn.Conv2d(nf * 2, nf * 4, 4, 2, 1), nn.InstanceNorm2d(nf * 4), nn.LeakyReLU(0.2, True))
         self.enc4 = nn.Sequential(nn.Conv2d(nf * 4, nf * 8, 4, 2, 1), nn.InstanceNorm2d(nf * 8), nn.LeakyReLU(0.2, True))
 
-        # Bottleneck at 16x16, 512 channels
         self.bottleneck = SPADEResBlock(nf * 8, nf * 8, label_nc)
+        self.attn = SelfAttention(nf * 8) if use_attention else nn.Identity()
 
         # Decoder: 16 -> 32 -> 64 -> 128 -> 256
         self.up4 = SPADEResBlock(nf * 8, nf * 4, label_nc)  # + skip from enc3
@@ -92,10 +115,14 @@ class SPADEGenerator(nn.Module):
         self.skip3 = nn.Conv2d(nf * 4 + nf * 2, nf * 4, 1)
         self.skip2 = nn.Conv2d(nf * 2 + nf, nf * 2, 1)
 
+        act_map = {
+            "sigmoid": nn.Sigmoid(),
+            "hardtanh": nn.Hardtanh(0.0, 1.0),
+        }
         self.conv_out = nn.Sequential(
             nn.LeakyReLU(0.2, True),
             nn.Conv2d(nf, output_nc, 3, 1, 1),
-            nn.Sigmoid(),
+            act_map.get(output_act, nn.Sigmoid()),
         )
 
     def forward(self, seg):
@@ -105,8 +132,8 @@ class SPADEGenerator(nn.Module):
         e3 = self.enc3(e2)    # nf*4, 32
         e4 = self.enc4(e3)    # nf*8, 16
 
-        # Bottleneck
         x = self.bottleneck(e4, seg)
+        x = self.attn(x)
 
         # Decode with skip connections
         x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 32

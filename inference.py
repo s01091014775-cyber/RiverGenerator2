@@ -16,7 +16,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from dataset import HeightMapDataset, TARGET_CONFIGS, TERRAIN_MAX
+from dataset import HeightMapDataset, TARGET_CONFIGS, TERRAIN_MAX, VEL_BG, VEL_SCALE
+
+def _get_vel_amplify(target_type):
+    cfg = TARGET_CONFIGS.get(target_type, {})
+    return cfg.get("amplify", 1.0)
 from models import SPADEGenerator
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -45,13 +49,15 @@ def save_output(tensor, path, target_type, target_size=512):
     if target_type == "height":
         out = np.clip(arr[0] * 500.0, 0, 65535).astype(np.uint16)
         Image.fromarray(out, mode="I;16").save(path)
-    elif target_type == "vel":
+    elif target_type in ("vel", "vel_x25"):
+        amp = _get_vel_amplify(target_type)
         h, w = arr.shape[1], arr.shape[2]
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        rgba[:, :, 0] = np.clip(arr[0] * 255, 0, 255).astype(np.uint8)
-        rgba[:, :, 1] = np.clip(arr[1] * 255, 0, 255).astype(np.uint8)
-        rgba[:, :, 3] = 255
-        Image.fromarray(rgba, mode="RGBA").save(path)
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        r_px = (arr[0] - 0.5) / amp * VEL_SCALE + VEL_BG
+        g_px = (arr[1] - 0.5) / amp * VEL_SCALE + VEL_BG
+        rgb[:, :, 0] = np.clip(r_px, 0, 255).astype(np.uint8)
+        rgb[:, :, 1] = np.clip(g_px, 0, 255).astype(np.uint8)
+        Image.fromarray(rgb, mode="RGB").save(path)
     elif target_type == "foam":
         out = np.clip(arr[0] * 255, 0, 255).astype(np.uint8)
         Image.fromarray(out, mode="L").save(path)
@@ -64,26 +70,41 @@ def _auto_contrast(arr):
     return ((arr - lo) / (hi - lo) * 255).clip(0, 255).astype(np.uint8)
 
 
+def _make_vel_rgb(tensor, amplify=1.0):
+    """Combine 2-ch velocity tensor (R=vx, G=vy) into an RGB image.
+    Reverses normalization; amplify>1 means values were amplified during training."""
+    arr = tensor.cpu().numpy()
+    h, w = arr.shape[1], arr.shape[2]
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    r_px = (arr[0] - 0.5) / amplify * VEL_SCALE + VEL_BG
+    g_px = (arr[1] - 0.5) / amplify * VEL_SCALE + VEL_BG
+    rgb[:, :, 0] = np.clip(r_px, 0, 255).astype(np.uint8)
+    rgb[:, :, 1] = np.clip(g_px, 0, 255).astype(np.uint8)
+    rgb[:, :, 2] = 0
+    return rgb
+
+
 def save_comparison(label, target, pred, path, target_type):
     lbl = _auto_contrast(label.squeeze().cpu().numpy())
     H = lbl.shape[0]
-    gap = np.full((H, 4), 128, dtype=np.uint8)
-
     nc = target.shape[0]
-    panels = [lbl, gap]
+    amp = _get_vel_amplify(target_type)
 
-    for tensor in [target, pred]:
-        if nc == 1:
+    if nc == 2:
+        lbl_rgb = np.stack([lbl, lbl, lbl], axis=-1)
+        gap = np.full((H, 4, 3), 128, dtype=np.uint8)
+        gt_rgb = _make_vel_rgb(target, amp)
+        pred_rgb = _make_vel_rgb(pred, amp)
+        combined = np.concatenate([lbl_rgb, gap, gt_rgb, gap, pred_rgb], axis=1)
+        Image.fromarray(combined, mode="RGB").save(path)
+    else:
+        gap = np.full((H, 4), 128, dtype=np.uint8)
+        panels = [lbl, gap]
+        for tensor in [target, pred]:
             panels.append(_auto_contrast(tensor[0].cpu().numpy()))
-        else:
-            for ch in range(nc):
-                panels.append(_auto_contrast(tensor[ch].cpu().numpy()))
-                if ch < nc - 1:
-                    panels.append(np.full((H, 2), 64, dtype=np.uint8))
-        panels.append(gap)
-
-    combined = np.concatenate(panels[:-1], axis=1)
-    Image.fromarray(combined, mode="L").save(path)
+            panels.append(gap)
+        combined = np.concatenate(panels[:-1], axis=1)
+        Image.fromarray(combined, mode="L").save(path)
 
 
 def compute_metrics(pred, target, label, threshold=0.005):
@@ -109,7 +130,9 @@ def run_eval(args):
     output_nc = cfg["channels"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    netG = SPADEGenerator(label_nc=1, output_nc=output_nc, ngf=args.ngf).to(device)
+    netG = SPADEGenerator(label_nc=1, output_nc=output_nc, ngf=args.ngf,
+                          use_attention=not args.no_attention,
+                          output_act=args.output_act).to(device)
     state = torch.load(args.checkpoint, map_location=device, weights_only=True)
     netG.load_state_dict(state)
     netG.eval()
@@ -166,7 +189,7 @@ def run_eval(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", type=str, default="height",
-                        choices=["height", "vel", "foam"])
+                        choices=["height", "vel", "vel_x25", "foam"])
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--input", type=str, default=None)
     parser.add_argument("--input_dir", type=str, default=None)
@@ -177,6 +200,10 @@ def main():
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--out_size", type=int, default=512)
     parser.add_argument("--ngf", type=int, default=64)
+    parser.add_argument("--no_attention", action="store_true",
+                        help="Disable self-attention in generator bottleneck")
+    parser.add_argument("--output_act", type=str, default="sigmoid",
+                        choices=["sigmoid", "hardtanh"])
     args = parser.parse_args()
 
     if args.checkpoint is None:
@@ -194,7 +221,9 @@ def main():
     output_nc = cfg["channels"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    netG = SPADEGenerator(label_nc=1, output_nc=output_nc, ngf=args.ngf).to(device)
+    netG = SPADEGenerator(label_nc=1, output_nc=output_nc, ngf=args.ngf,
+                          use_attention=not args.no_attention,
+                          output_act=args.output_act).to(device)
     state = torch.load(args.checkpoint, map_location=device, weights_only=True)
     netG.load_state_dict(state)
     netG.eval()

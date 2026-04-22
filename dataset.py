@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
+VEL_BG = 186.0
+VEL_SCALE = 186.0
+
 TARGET_CONFIGS = {
     "height": {
         "subdir": "train_img_height",
@@ -21,6 +24,18 @@ TARGET_CONFIGS = {
         "dtype": "rgba_rg",
         "max_val": 255.0,
         "fg_threshold": 0.01,
+        "bg_value": VEL_BG,
+        "scale": VEL_SCALE,
+    },
+    "vel_x25": {
+        "subdir": "train_img_vel_x25",
+        "channels": 2,
+        "dtype": "rgba_rg",
+        "max_val": 255.0,
+        "fg_threshold": 0.01,
+        "bg_value": VEL_BG,
+        "scale": VEL_SCALE,
+        "amplify": 2.5,
     },
     "foam": {
         "subdir": "train_img_vel",
@@ -90,7 +105,11 @@ class HeightMapDataset(Dataset):
             t = torch.from_numpy(arr).unsqueeze(0)
         elif dt == "rgba_rg":
             arr = np.array(img, dtype=np.float32)
-            rg = arr[:, :, :2] / self.cfg["max_val"]
+            rg = arr[:, :, :2]
+            bg = self.cfg["bg_value"]
+            scale = self.cfg["scale"]
+            rg = (rg - bg) / scale + 0.5
+            rg = np.clip(rg, 0.0, 1.0)
             t = torch.from_numpy(rg).permute(2, 0, 1)
         elif dt == "rgba_a":
             arr = np.array(img, dtype=np.float32)
@@ -103,6 +122,26 @@ class HeightMapDataset(Dataset):
             t = F.interpolate(t.unsqueeze(0), size=(self.img_size, self.img_size),
                               mode="bilinear", align_corners=False).squeeze(0)
         return t
+
+    @staticmethod
+    def _rotate_vel(target, k):
+        """Apply velocity direction correction after spatial rot90.
+        In normalized space center=0.5, negate means 1.0 - val.
+        k=1 (90° CCW): (Vx,Vy) → (-Vy, Vx)
+        k=2 (180°):    (Vx,Vy) → (-Vx,-Vy)
+        k=3 (270° CCW):(Vx,Vy) → ( Vy,-Vx)
+        """
+        vx, vy = target[0].clone(), target[1].clone()
+        if k == 1:
+            target[0] = 1.0 - vy
+            target[1] = vx
+        elif k == 2:
+            target[0] = 1.0 - vx
+            target[1] = 1.0 - vy
+        elif k == 3:
+            target[0] = vy
+            target[1] = 1.0 - vx
+        return target
 
     def _random_crop(self, label, target, scale_range=(0.8, 1.0)):
         s = torch.empty(1).uniform_(*scale_range).item()
@@ -123,18 +162,29 @@ class HeightMapDataset(Dataset):
         label = self._load_label(self.label_paths[idx])
         target = self._load_target(self.img_paths[idx])
 
+        is_vel = self.target_type in ("vel", "vel_x25")
+
         if self.augment:
             if torch.rand(1).item() > 0.5:
                 label = torch.flip(label, [-1])
                 target = torch.flip(target, [-1])
+                if is_vel:
+                    target[0] = 1.0 - target[0]
             if torch.rand(1).item() > 0.5:
                 label = torch.flip(label, [-2])
                 target = torch.flip(target, [-2])
+                if is_vel:
+                    target[1] = 1.0 - target[1]
             k = torch.randint(0, 4, (1,)).item()
             if k:
                 label = torch.rot90(label, k, [-2, -1])
                 target = torch.rot90(target, k, [-2, -1])
+                if is_vel:
+                    target = self._rotate_vel(target, k)
             if torch.rand(1).item() > 0.5:
                 label, target = self._random_crop(label, target)
+            if torch.rand(1).item() > 0.3:
+                jitter = 1.0 + (torch.rand(1).item() - 0.5) * 0.1
+                label = (label * jitter).clamp(0.0, 1.0)
 
         return label, target
