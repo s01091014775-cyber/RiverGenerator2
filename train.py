@@ -104,6 +104,23 @@ def magnitude_loss(pred, target, label, threshold=0.01):
     return diff.sum() / n_fg
 
 
+def fft_loss(pred, target, label=None, threshold=0.01, high_freq_weight=2.0):
+    """Frequency-domain L1 loss — penalizes missing high-frequency content.
+    Applies a ramp weight that emphasizes high frequencies over low ones."""
+    pred_fft = torch.fft.rfft2(pred, norm="ortho")
+    tgt_fft = torch.fft.rfft2(target, norm="ortho")
+
+    diff = torch.abs(pred_fft - tgt_fft)
+
+    H, W2 = diff.shape[-2], diff.shape[-1]
+    fy = torch.linspace(0, 1, H, device=pred.device).view(1, 1, H, 1)
+    fx = torch.linspace(0, 1, W2, device=pred.device).view(1, 1, 1, W2)
+    freq_dist = torch.sqrt(fy ** 2 + fx ** 2).clamp(0, 1)
+    weight = 1.0 + freq_dist * (high_freq_weight - 1.0)
+
+    return (diff * weight).mean()
+
+
 def r1_gradient_penalty(d_real_feats, real_images):
     """R1 gradient penalty to prevent D from becoming too strong."""
     grad = torch.autograd.grad(
@@ -233,6 +250,8 @@ def main():
                         help="R1 gradient penalty weight for D (recommended ~10)")
     parser.add_argument("--r1_every", type=int, default=16,
                         help="Apply R1 penalty every N D steps")
+    parser.add_argument("--lambda_fft", type=float, default=0.0,
+                        help="FFT frequency-domain loss weight (recommended ~5-10 for sharper details)")
     args = parser.parse_args()
 
     cfg = TARGET_CONFIGS[args.target]
@@ -242,6 +261,7 @@ def main():
     use_grad = args.lambda_grad > 0
     use_angular = args.lambda_angular > 0 and output_nc == 2
     use_mag = args.lambda_mag > 0 and output_nc == 2
+    use_fft = args.lambda_fft > 0
     pretrain = args.pretrain
     use_r1 = args.r1_gamma > 0 and not pretrain
 
@@ -395,6 +415,8 @@ def main():
                     loss_g = loss_g + vgg_loss_fn(fake, target) * args.lambda_vgg
                 if use_grad:
                     loss_g = loss_g + spatial_gradient_loss(fake, target) * args.lambda_grad
+                if use_fft:
+                    loss_g = loss_g + fft_loss(fake, target, label, fg_thresh) * args.lambda_fft
                 if use_angular:
                     loss_g = loss_g + angular_velocity_loss(fake, target, label, fg_thresh) * args.lambda_angular
                 if use_mag:
